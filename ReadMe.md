@@ -11,11 +11,7 @@ python reproduce_cath.py (optional)
 # 3
 JSON to PDB to 3di tokens
 
-python jsonl_to_3di.py \
-        --jsonl     data/cath/chain_set.jsonl \
-        --pdb_dir   data/cath/pdb_files \
-        --tsv       data/cath/3di_raw.tsv \
-        --out_jsonl data/cath/chain_set_3di.jsonl \
+python jsonl_to_3di.py --jsonl data/cath/chain_set.jsonl --pdb_dir   data/cath/pdb_files --tsv data/cath/3di_raw.tsv --out_jsonl data/cath/chain_set_3di.jsonl
 
 # 4
 inference before lora
