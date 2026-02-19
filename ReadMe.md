@@ -1,3 +1,65 @@
+# 1
+conda env create -f environment.yml
+
+conda activate pifold_env
+
+./download_data.sh
+
+# 2
+python reproduce_cath.py (optional)
+
+# 3
+JSON to PDB to 3di tokens
+
+python jsonl_to_3di.py \
+        --jsonl     data/cath/chain_set.jsonl \
+        --pdb_dir   data/cath/pdb_files \
+        --tsv       data/cath/3di_raw.tsv \
+        --out_jsonl data/cath/chain_set_3di.jsonl \
+
+# 4
+inference before lora
+
+python inference_3di.py --split Truncated --max_samples 10 \
+    --output_file results_3di_zeroshot.json
+
+python inference_3di.py --split Truncated --max_samples 10 --few_shot_k 3 \
+    --output_file results_3di_3shot.json
+
+# 5
+lora training
+python lora_3di.py --split Truncated --max_samples 500 --num_epochs 3 --output_dir lora_3di
+
+# 6
+inference after lora
+
+python inference_3di.py --split Truncated --max_samples 10\
+    --lora_adapter lora_3di \
+    --output_file results_3di_lora.json
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---------------------------------------------------------
 # PiFold: Toward effective and efficient protein inverse folding
 
 ![GitHub stars](https://img.shields.io/github/stars/A4Bio/PiFold)  ![GitHub forks](https://img.shields.io/github/forks/A4Bio/PiFold?color=green) <!-- ![visitors](https://visitor-badge.glitch.me/badge?page_id=A4Bio.PiFold) -->
