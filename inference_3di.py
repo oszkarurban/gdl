@@ -203,9 +203,17 @@ def is_copying_input(seq_3di: str, prediction: str) -> bool:
     return (matches / n) > 0.8
 
 
+# def clean_prediction(raw: str) -> str:
+#     # previously i was filtering
+#     return raw
+
 def clean_prediction(raw: str) -> str:
-    # previously i was filtering
-    return raw
+    alphabet = set('ACDEFGHIKLMNPQRSTVWY')
+    tokens = raw.strip().split()
+    candidate = tokens[0] if tokens else ''
+    if all(c in alphabet for c in candidate.upper()):
+        return candidate.upper()
+    return ''.join(c for c in raw.upper() if c in alphabet)
 
 
 def main():

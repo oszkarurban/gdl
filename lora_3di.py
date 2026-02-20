@@ -152,11 +152,11 @@ def main(args):
         os.path.join(args.data_root, 'cath', 'chain_set_3di.jsonl'),
         truncate_to=truncate_to,
     )
-    train_list, val_list = get_split_data(
+    val_list, train_list = get_split_data(
         full_data,
         os.path.join(args.data_root, 'cath', split_file),
         seed=args.seed,
-    )
+    ) #!!!!Important: val_list first, then train_list
 
     if args.max_samples is not None:
         train_list = train_list[:args.max_samples]
