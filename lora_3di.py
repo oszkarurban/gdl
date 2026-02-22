@@ -1,257 +1,223 @@
 """
-lora_3di.py  —  LoRA fine-tuning for inverse folding using Foldseek 3Di tokens.
-
+lora_3di.py
+--------------
+Fine-tune Llama-3-8B with LoRA on CATH inverse folding (3Di → AA).
 
 Usage:
-    python lora_3di.py --split Truncated --max_samples 500 --num_epochs 3 \
-        --output_dir lora_3di_sanity
+    # Single GPU
+    python lora_3di.py --data_dir data/tokenized3 --out_dir results/llm_3di
+
+    # Multi-GPU
+    CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --num_processes 4 \
+        lora_3di.py --data_dir data/tokenized3 --out_dir results/llm_3di
+
+    # Subset experiment
+    python lora_3di.py --n_train 500 --out_dir results/llm_3di_n500
 """
 
-import json
-import os
-import argparse
+import json, os, random, argparse
 import numpy as np
 import torch
-from dataclasses import dataclass
-
-import transformers
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
 from torch.utils.data import Dataset
-from peft import LoraConfig, get_peft_model
-from inference_3di import load_3di_data, get_split_data, format_3di, build_system_message
+from transformers import (
+    AutoTokenizer, AutoModelForCausalLM,
+    TrainingArguments, Trainer, DataCollatorForSeq2Seq,
+)
+from peft import LoraConfig, get_peft_model, TaskType
 
-IGNORE_INDEX = -100
-MAX_LENGTH   = 2048
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # <-- SILENCES TOKENIZER FORK WARNING
 
-ALPHABET_3DI = "A C D E F G H I K L M N P Q R S T V W Y"
-ALPHABET_AA  = "A C D E F G H I K L M N P Q R S T V W Y"
-
-SPLIT_MAP = {
-    'Truncated':    ('chain_set_splits.json', 100),
-    'All':          ('chain_set_splits.json', None),
-    'Short':        ('test_split_L100.json',  None),
-    'Single Chain': ('test_split_sc.json',    None),
-}
+STRUCT_BOS = "<struct>"
+SEQ_BOS    = "<seq>"
+AA_CHARS   = list("ACDEFGHIKLMNPQRSTVWY")
+DI3_CHARS  = list("acdefghiklmnpqrstvwy")
 
 
-def build_prompt_and_completion(item: dict, tokenizer, token_format: str) -> tuple:
-    """
-    Returns (prompt_str, completion_str).
-    Prompt is masked in labels (IGNORE_INDEX).
-    """
-    system_msg = build_system_message(token_format)
-    struct_str = format_3di(item['seq_3di'], token_format)
-
-    prompt = (
-        f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
-        f"{system_msg}<|eot_id|>"
-        f"<|start_header_id|>user<|end_header_id|>\n\n"
-        f"3Di structure:\n{struct_str}<|eot_id|>"
-        f"<|start_header_id|>assistant<|end_header_id|>\n\n"
-    )
-    completion = f"{item['seq']}{tokenizer.eos_token}"
-    return prompt, completion
+def make_prompt(tokens_3di, aa_seq=""):
+    return f"{STRUCT_BOS}{tokens_3di}{SEQ_BOS}{aa_seq}"
 
 
-class ProteinDesign3DiDataset(Dataset):
-    def __init__(self, data_list: list, tokenizer, token_format: str = 'flat'):
-        self.data         = data_list
-        self.tokenizer    = tokenizer
-        self.token_format = token_format
+def setup_tokenizer(model_name):
+    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tok.pad_token    = tok.eos_token
+    tok.padding_side = "right"
+    tok.add_special_tokens({"additional_special_tokens": [STRUCT_BOS, SEQ_BOS]})
+    new = [t for t in AA_CHARS + DI3_CHARS if t not in tok.get_vocab()]
+    if new:
+        tok.add_tokens(new)
+        print(f"  Added {len(new)} atomic residue tokens")
+    return tok
 
-    def __len__(self):
-        return len(self.data)
 
-    def __getitem__(self, index):
-        item = self.data[index]
+class InverseFoldingDataset(Dataset):
+    def __init__(self, path, tokenizer, max_length, n_samples=-1):
+        records = [json.loads(l) for l in open(path) if l.strip()]
+        records = [r for r in records if r.get("tokens_3di") and r.get("seq")]
+        if n_samples > 0:
+            random.shuffle(records)
+            records = records[:n_samples]
+        self.records, self.tokenizer, self.max_length = records, tokenizer, max_length
+        print(f"  {len(records)} examples from {os.path.basename(path)}")
 
-        prompt, completion = build_prompt_and_completion(
-            item, self.tokenizer, self.token_format,
+    def __len__(self): return len(self.records)
+
+    def __getitem__(self, idx):
+        r   = self.records[idx]
+        enc = self.tokenizer(
+            make_prompt(r["tokens_3di"], r["seq"]),
+            truncation=True, max_length=self.max_length,
+            padding=False, return_tensors=None, add_special_tokens=True,
         )
+        input_ids = enc["input_ids"]
+        labels    = list(input_ids)
 
-        prompt_ids     = self.tokenizer(prompt,     add_special_tokens=False).input_ids
-        completion_ids = self.tokenizer(completion, add_special_tokens=False).input_ids
+        # Mask 3Di prompt — loss only on AA output
+        n_prompt = len(self.tokenizer.encode(
+            make_prompt(r["tokens_3di"]), add_special_tokens=True
+        ))
+        
+        for i in range(min(n_prompt, len(labels))):
+            labels[i] = -100
 
-        input_ids = torch.tensor(prompt_ids + completion_ids, dtype=torch.long)
-        labels    = torch.tensor(
-            [IGNORE_INDEX] * len(prompt_ids) + completion_ids,
-            dtype=torch.long,
-        )
+        # if idx == 0:
+        #     seq_bos_id = self.tokenizer.convert_tokens_to_ids(SEQ_BOS)
+        #     if seq_bos_id in input_ids:
+        #         actual_prompt_end = input_ids.index(seq_bos_id) + 1
+        #     else:
+        #         actual_prompt_end = -1
+        #     n_masked = sum(1 for l in labels if l == -100)
+        #     n_visible = sum(1 for l in labels if l != -100)
+        #     print(f"\n[MASK DEBUG idx=0]")
+        #     print(f"  n_prompt (encode-based) : {n_prompt}")
+        #     print(f"  <seq> token position+1  : {actual_prompt_end}")
+        #     print(f"  match                   : {n_prompt == actual_prompt_end}")
+        #     print(f"  tokens masked (-100)    : {n_masked}")
+        #     print(f"  tokens visible (labels) : {n_visible}")
+        #     print(f"  input_ids[:5]           : {input_ids[:5]}")
+        #     print(f"  labels[n_prompt-2:n_prompt+3]: {labels[max(0,n_prompt-2):n_prompt+3]}")
 
-        input_ids = input_ids[:MAX_LENGTH]
-        labels    = labels[:MAX_LENGTH]
+        if input_ids[-1] != self.tokenizer.eos_token_id:
+            input_ids = input_ids + [self.tokenizer.eos_token_id]
+            labels    = labels    + [self.tokenizer.eos_token_id]
 
-        return dict(input_ids=input_ids, labels=labels)
-
-
-
-@dataclass
-class DataCollatorForSupervisedDataset:
-    tokenizer: transformers.PreTrainedTokenizer
-
-    def __call__(self, instances):
-        input_ids, labels = tuple(
-            [inst[key].clone().detach() for inst in instances]
-            for key in ('input_ids', 'labels')
-        )
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True,
-            padding_value=self.tokenizer.pad_token_id,
-        )
-        labels = torch.nn.utils.rnn.pad_sequence(
-            labels, batch_first=True, padding_value=IGNORE_INDEX,
-        )
-        return dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
-
-
-def setup_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
-        model_max_length=MAX_LENGTH,
-        padding_side='right',
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.float16,
-    )
-
-    lora_config = LoraConfig(
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        bias='none',
-        task_type='CAUSAL_LM',
-        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj',
-                        'gate_proj', 'up_proj', 'down_proj'],
-    )
-    model = get_peft_model(model, lora_config)
-    model.enable_input_require_grads()
-    model.print_trainable_parameters()
-
-    return model, tokenizer
+        return {
+            "input_ids":      input_ids,
+            "attention_mask": [1] * len(input_ids), 
+            "labels":         labels,
+        }
 
 
 def main(args):
-    model, tokenizer = setup_model(args)
+    random.seed(42); np.random.seed(42); torch.manual_seed(42)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    split_file, truncate_to = SPLIT_MAP[args.split]
+    print(f"Tokenizer: {args.model_name}")
+    tokenizer = setup_tokenizer(args.model_name)
 
-    full_data = load_3di_data(
-        os.path.join(args.data_root, 'cath', 'chain_set_3di.jsonl'),
-        truncate_to=truncate_to,
+    # Load directly in bfloat16
+    print(f"Model: {args.model_name}")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        torch_dtype=torch.bfloat16,  # <-- FIXED: Load directly in bfloat16
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
     )
-    val_list, train_list = get_split_data(
-        full_data,
-        os.path.join(args.data_root, 'cath', split_file),
-        seed=args.seed,
-    ) #!!!!Important: val_list first, then train_list
+    model.resize_token_embeddings(len(tokenizer), mean_resizing=True)
+    model.config.use_cache = False
 
-    if args.max_samples is not None:
-        train_list = train_list[:args.max_samples]
-        val_list   = val_list[:max(1, args.max_samples // 4)]
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_r,
+        lora_alpha=args.lora_r * 2,
+        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+        modules_to_save=["embed_tokens"], #"lm_head"],  # <-- CRITICAL FIX: Unfreeze embeddings and head
+        lora_dropout=0.05,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.print_trainable_parameters()
 
-    print(f"\nSplit       : {args.split} ({split_file})")
-    print(f"truncate_to : {truncate_to}")
-    print(f"Train       : {len(train_list)} | Val: {len(val_list)}")
-    print(f"Token format: {args.token_format}")
-    print(f"LR          : {args.lr}\n")
+    print("Datasets:")
+    train_ds = InverseFoldingDataset(
+        os.path.join(args.data_dir, "train.jsonl"), tokenizer, args.max_length, args.n_train,
+    )
+    val_ds = InverseFoldingDataset(
+        os.path.join(args.data_dir, "validation.jsonl"), tokenizer, args.max_length,
+    )
 
-    train_dataset = ProteinDesign3DiDataset(train_list, tokenizer, args.token_format)
-    val_dataset   = ProteinDesign3DiDataset(val_list,   tokenizer, args.token_format)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    # Sanity check
+    s = train_ds[0]
+    n_label = sum(1 for label in s["labels"] if label != -100)
+    assert n_label > 0, "All labels masked — prompt masking bug"
+    print(f"  sanity: input_len={len(s['input_ids'])}  label_tokens={n_label}")
 
-    ex             = train_dataset[0]
-    n_masked       = (ex['labels'] == IGNORE_INDEX).sum().item()
-    n_supervised   = (ex['labels'] != IGNORE_INDEX).sum().item()
-    supervised_ids = ex['labels'][ex['labels'] != IGNORE_INDEX]
-    decoded        = tokenizer.decode(supervised_ids)
-    print("--- Masking debug (train example 0) ---")
-    print(f"  Total tokens       : {len(ex['input_ids'])}")
-    print(f"  Masked (prompt)    : {n_masked}")
-    print(f"  Supervised (target): {n_supervised}")
-    print(f"  Supervised text    : {repr(decoded)}")
-    assert decoded.endswith(tokenizer.eos_token), \
-        "ERROR: supervised text does not end with eos_token"
-    aa_only = decoded.replace(tokenizer.eos_token, '')
-    assert all(c in 'ACDEFGHIKLMNPQRSTVWY' for c in aa_only), \
-        f"ERROR: supervised text contains non-AA characters: {set(aa_only) - set('ACDEFGHIKLMNPQRSTVWY')}"
-    print("  Masking looks correct")
-    print("--- End debug ---\n")
+    n_gpus    = max(torch.cuda.device_count(), 1)
+    eff_batch = args.batch_size * args.grad_accum * n_gpus
+    print(f"  GPUs={n_gpus}  eff_batch={eff_batch}  steps/epoch≈{max(1, len(train_ds)//eff_batch)}")
 
     training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        num_train_epochs=args.num_epochs,
+        output_dir=args.out_dir,
+        num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_eval_batch_size=1,
         gradient_accumulation_steps=args.grad_accum,
-        learning_rate=args.lr,
-        lr_scheduler_type='cosine',
-        warmup_ratio=0.03,
-        fp16=True,
         gradient_checkpointing=True,
-        logging_steps=10,
-        eval_strategy='epoch',
-        save_strategy='epoch',
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        learning_rate=args.lr,
+        lr_scheduler_type="constant",
+        warmup_ratio=0.1,             # <-- FIXED: Dynamic warmup instead of flat 100 steps
+        bf16=True,
+        fp16=False,
+        optim="paged_adamw_8bit",
+        logging_steps=1,              # <-- FIXED: Log every step so you actually see train loss
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        save_total_limit=3,
         load_best_model_at_end=True,
-        metric_for_best_model='eval_loss',
-        optim='paged_adamw_8bit',
-        max_grad_norm=0.3,
-        report_to='wandb',
-        run_name=(
-            f"lora_3di_{args.split}_{args.token_format}"
-            f"_r{args.lora_rank}_lr{args.lr}_ep{args.num_epochs}"
-        ),
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        report_to="wandb",
+        dataloader_num_workers=2,
         remove_unused_columns=False,
+        ddp_find_unused_parameters=True,
+        max_grad_norm=1.0
     )
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        data_collator=data_collator,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        data_collator=DataCollatorForSeq2Seq(
+            tokenizer=tokenizer, model=model,
+            padding=True, pad_to_multiple_of=8, label_pad_token_id=-100,
+        ),
     )
-
     trainer.train()
 
-    print(f"\nBest checkpoint : {trainer.state.best_model_checkpoint}")
-    print(f"Best eval_loss  : {trainer.state.best_metric:.4f}")
+    model.save_pretrained(args.out_dir)
+    tokenizer.save_pretrained(args.out_dir)
+    print(f"Saved → {args.out_dir}")
 
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    print(f"LoRA adapter saved → {args.output_dir}")
+    json.dump({
+        "model": args.model_name, "n_train": len(train_ds),
+        "lora_r": args.lora_r, "lr": args.lr, "epochs": args.epochs,
+    }, open(os.path.join(args.out_dir, "config.json"), "w"), indent=2)
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path',   default='meta-llama/Meta-Llama-3-8B-Instruct')
-    parser.add_argument('--data_root',    default='data/')
-    parser.add_argument('--output_dir',   default='lora_3di_adapter')
-    parser.add_argument('--split',        default='Truncated',
-                        choices=['Truncated', 'Short', 'All', 'Single Chain'])
-    parser.add_argument('--seed',         type=int,   default=42)
-    parser.add_argument('--max_samples',  type=int,   default=None)
-    parser.add_argument('--token_format', default='flat', choices=['flat', 'spaced'])
-    parser.add_argument('--num_epochs',   type=int,   default=10)
-    parser.add_argument('--batch_size',   type=int,   default=1)
-    parser.add_argument('--grad_accum',   type=int,   default=4)
-    parser.add_argument('--lr',           type=float, default=2e-5,
-                        help='Safe default for instruct model. Try 5e-5 if loss plateaus.')
-    parser.add_argument('--lora_rank',    type=int,   default=16)
-    parser.add_argument('--lora_alpha',   type=int,   default=32)
-    parser.add_argument('--lora_dropout', type=float, default=0.05)
-    args = parser.parse_args()
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--model_name", default="meta-llama/Meta-Llama-3-8B")
+    p.add_argument("--data_dir",   default="data/tokenized")
+    p.add_argument("--out_dir",    default="results/llm_3di")
+    p.add_argument("--n_train",    type=int,   default=-1)
+    p.add_argument("--max_length", type=int,   default=512)
+    p.add_argument("--epochs",     type=int,   default=10)
+    p.add_argument("--batch_size", type=int,   default=2)
+    p.add_argument("--grad_accum", type=int,   default=16)
+    p.add_argument("--lr",         type=float, default=1e-4)
+    p.add_argument("--lora_r",     type=int,   default=32)
+    main(p.parse_args())
 
-    main(args)
+

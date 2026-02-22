@@ -1,193 +1,128 @@
 """
-jsonl_to_3di.py  —  CATH jsonl to PDB files to Foldseek 3Di to merged jsonl
+jsonl_to_3di.py
+------------------
+CATH chain_set.jsonl → PDB files → Foldseek 3Di tokens → train/val/test JSONL
+
+NaN strategy: trim leading/trailing NaN residues, skip internal gaps.
 
 Usage:
-    python jsonl_to_3di.py \
-        --jsonl     data/cath/chain_set.jsonl \
-        --pdb_dir   data/cath/pdb_files \
-        --tsv       data/cath/3di_raw.tsv \
-        --out_jsonl data/cath/chain_set_3di.jsonl \
+    python jsonl_to_3di.py --data_dir data/cath2 --out_dir data/tokenized
 """
 
-import json
-import os
-import argparse
-import subprocess
-import numpy as np
+import json, math, os, argparse, subprocess, tempfile
 from pathlib import Path
-from tqdm import tqdm
 
-
-AA3 = {
-    'A':'ALA','C':'CYS','D':'ASP','E':'GLU','F':'PHE',
-    'G':'GLY','H':'HIS','I':'ILE','K':'LYS','L':'LEU',
-    'M':'MET','N':'ASN','P':'PRO','Q':'GLN','R':'ARG',
-    'S':'SER','T':'THR','V':'VAL','W':'TRP','Y':'TYR',
+BACKBONE = ["N", "CA", "C", "O"]
+AA_3 = {
+    'A':'ALA','C':'CYS','D':'ASP','E':'GLU','F':'PHE','G':'GLY','H':'HIS',
+    'I':'ILE','K':'LYS','L':'LEU','M':'MET','N':'ASN','P':'PRO','Q':'GLN',
+    'R':'ARG','S':'SER','T':'THR','V':'VAL','W':'TRP','Y':'TYR',
+    'X':'UNK','U':'UNK','O':'UNK','B':'ASN','Z':'GLN','J':'LEU',
 }
-BACKBONE_ATOMS = ['N', 'CA', 'C', 'O']
-ATOM_LINE = (
-    "ATOM  {serial:5d} {name:<4s}{altLoc:1s}{resName:3s} {chainID:1s}"
-    "{resSeq:4d}{iCode:1s}   "
-    "{x:8.3f}{y:8.3f}{z:8.3f}"
-    "{occupancy:6.2f}{tempFactor:6.2f}          "
-    "{element:>2s}\n"
-)
-
 
 def is_nan(v):
-    return v != v
+    try: return v is None or math.isnan(float(v))
+    except: return True
 
+def residue_nan(coords, i):
+    for atom in BACKBONE:
+        xyz = coords.get(atom, [])[i] if i < len(coords.get(atom, [])) else None
+        if xyz is None or len(xyz) != 3 or any(is_nan(v) for v in xyz): return True
+    return False
 
+def trim(seq, coords, min_len):
+    nan_mask = [residue_nan(coords, i) for i in range(len(seq))]
+    start = next((i for i, bad in enumerate(nan_mask) if not bad), None)
+    if start is None: return None
+    end = len(seq) - next(i for i, bad in enumerate(reversed(nan_mask)) if not bad)
+    if any(nan_mask[start:end]): return None   # internal gap
+    if end - start < min_len: return None
+    return seq[start:end], {a: coords[a][start:end] for a in BACKBONE}
 
-def write_pdb(entry: dict, path: str) -> int:
-    seq, coords = entry['seq'], entry['coords']
-    serial, res_idx, lines = 1, 0, []
-    for i in range(len(seq)):
-        atom_coords = {}
-        for atom in BACKBONE_ATOMS:
-            row = coords.get(atom, [[]])[i]
-            if row is None or len(row) != 3 or any(is_nan(v) for v in row):
-                return 0   # NaN check 
-            atom_coords[atom] = row
-        res_idx += 1
-        for atom in BACKBONE_ATOMS:
-            x, y, z = atom_coords[atom]
-            lines.append(ATOM_LINE.format(
-                serial=serial, name=f" {atom:<3s}", altLoc=' ',
-                resName=AA3[seq[i]], chainID='A', resSeq=res_idx, iCode=' ',
-                x=x, y=y, z=z, occupancy=1.0, tempFactor=0.0, element=atom[0],
-            ))
-            serial += 1
+def write_pdb(name, seq, coords, path):
+    lines, idx = [], 1
+    for ri, aa in enumerate(seq):
+        for atom in BACKBONE:
+            x, y, z = [float(v) for v in coords[atom][ri]]
+            lines.append(
+                f"ATOM  {idx:5d}  {atom:<3s} {AA_3.get(aa,'UNK')} A{ri+1:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           {atom[0]:>2s}\n"
+            )
+            idx += 1
     lines.append("END\n")
-    with open(path, 'w') as f:
-        f.writelines(lines)
-    return res_idx
+    Path(path).write_text("".join(lines))
 
+def run_foldseek(pdb_dir, binary, threads):
+    with tempfile.TemporaryDirectory() as tmp:
+        db, fasta = f"{tmp}/db", f"{tmp}/3di.fasta"
+        for cmd in [
+            [binary, "createdb", pdb_dir, db, "--threads", str(threads)],
+            [binary, "lndb", db + "_h", db + "_ss_h"],
+            [binary, "convert2fasta", db + "_ss", fasta],
+        ]:
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"Foldseek failed: {r.stderr.decode()[:400]}")
+        tokens, name, parts = {}, None, []
+        for line in Path(fasta).read_text().splitlines():
+            if line.startswith(">"):
+                if name: tokens[name] = "".join(parts)
+                name, parts = line[1:].split()[0], []
+            else:
+                parts.append(line)
+        if name: tokens[name] = "".join(parts)
+    return tokens
 
-def jsonl_to_pdbs(jsonl_path: str, pdb_dir: str, max_length: int = 500) -> list:
-    Path(pdb_dir).mkdir(parents=True, exist_ok=True)
-    alphabet_set = set('ACDEFGHIKLMNPQRSTVWY')
-    entries, skipped = [], 0
+def main(args):
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(jsonl_path) as f:
-        lines = f.readlines()
+    raw    = [json.loads(l) for l in Path(args.data_dir, "chain_set.jsonl").open() if l.strip()]
+    splits = {k: set(v) for k, v in
+              json.load(open(Path(args.data_dir, "chain_set_splits.json"))).items()
+              if k in {"train", "validation", "test"}}
+    print(f"Loaded {len(raw)} entries | splits: { {k: len(v) for k, v in splits.items()} }")
 
-    print(f"\nWriting PDBs  {pdb_dir}/  ({len(lines)} entries in jsonl)")
-    for line in tqdm(lines, desc="  PDBs"):
-        entry  = json.loads(line)
-        seq    = entry['seq']
-        name   = entry['name']
-        coords = entry['coords']
-
-        # Filter too long
-        if len(set(seq) - alphabet_set) > 0 or len(seq) > max_length:
-            skipped += 1
-            continue
-
-        # Filter: any NaN in any backbone atom, skip entire protein
-        has_nan = False
-        for i in range(len(seq)):
-            for atom in BACKBONE_ATOMS:
-                row = coords.get(atom, [[]])[i]
-                if row is None or len(row) != 3 or any(is_nan(v) for v in row):
-                    has_nan = True
-                    break
-            if has_nan:
-                break
-        if has_nan:
-            skipped += 1
-            continue
-
-        safe_name = name.replace('/', '_').replace('.', '_')
-        pdb_path  = os.path.join(pdb_dir, f"{safe_name}.pdb")
-        if write_pdb(entry, pdb_path) == 0:
-            skipped += 1
-            continue
-
-        entries.append({
-            'name':      name,
-            'safe_name': safe_name,
-            'seq':       seq,
-            'CATH':      entry.get('CATH', []),
-        })
-
-    print(f"  Written: {len(entries)}  |  Skipped: {skipped}")
-    return entries
-
-
-def run_foldseek(pdb_dir: str, tsv_path: str):
-    print(f"\nRunning foldseek  {tsv_path}")
-    subprocess.run(
-        ['foldseek', 'structureto3didescriptor', pdb_dir, tsv_path],
-        check=True,
-    )
-    print("  Done.")
-
-
-def parse_tsv(tsv_path: str) -> dict:
-    """Returns dict: "12as_A.pdb" to "DVQTA..." """
-    mapping = {}
-    with open(tsv_path) as f:
-        for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) >= 3:
-                mapping[parts[0]] = parts[2].upper()
-    print(f"  Parsed {len(mapping)} 3Di sequences  (sample key: {next(iter(mapping))})")
-    return mapping
-
-def merge(entries: list, mapping: dict) -> list:
-    matched, unmatched = [], []
-    for e in entries:
-        seq_3di = mapping.get(e['safe_name'] + '.pdb')
-        if seq_3di:
-            e['seq_3di'] = seq_3di
-            matched.append(e)
+    # Filter and trim NaN residues
+    clean = {}
+    for e in raw:
+        name, seq, coords = e["name"], e["seq"], e["coords"]
+        if not any(residue_nan(coords, i) for i in range(len(seq))):
+            if len(seq) >= args.min_len:
+                clean[name] = (seq, coords)
         else:
-            unmatched.append(e['name'])
-    print(f"\n[Step 3] Matched: {len(matched)}  |  Unmatched: {len(unmatched)}")
-    if unmatched:
-        print(f"  First unmatched: {unmatched[:3]}")
-    return matched
+            result = trim(seq, coords, args.min_len)
+            if result:
+                clean[name] = result
+    print(f"Kept {len(clean)}/{len(raw)} after NaN filtering (min_len={args.min_len})")
 
-def write_jsonl(matched: list, out_path: str):
-    import random
-    # Sanity check
-    mismatches = sum(len(e['seq']) != len(e['seq_3di']) for e in matched)
-    print(f"\n Length mismatches: {mismatches}  (must be 0)")
-    assert mismatches == 0, "seq / seq_3di length mismatch — check pipeline"
+    # Write PDBs
+    pdb_dir = out_dir / "pdbs"
+    pdb_dir.mkdir(exist_ok=True)
+    for name, (seq, coords) in clean.items():
+        p = pdb_dir / f"{name}.pdb"
+        if not p.exists():
+            write_pdb(name, seq, coords, p)
 
-    print("  Examples:")
-    for e in random.sample(matched, min(5, len(matched))):
-        print(f"    {e['name']:<15s}  AA : {e['seq'][:30]}")
-        print(f"    {'':15s}  3Di: {e['seq_3di'][:30]}")
+    print("Running Foldseek...")
+    tokens = run_foldseek(str(pdb_dir), args.foldseek_bin, args.threads)
+    print(f"Foldseek: {len(tokens)} entries")
 
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, 'w') as f:
-        for e in matched:
-            f.write(json.dumps({
-                'name':    e['name'],
-                'seq':     e['seq'],
-                'seq_3di': e['seq_3di'],
-                'CATH':    e['CATH'],
-            }) + '\n')
-    print(f"\n  Wrote {len(matched)} entries  {out_path}")
+    for split, ids in splits.items():
+        records = []
+        for name in ids:
+            if name not in clean or name not in tokens: continue
+            seq, tok = clean[name][0], tokens[name]
+            if len(tok) != len(seq): continue
+            records.append({"name": name, "seq": seq, "length": len(seq), "tokens_3di": tok})
+        (out_dir / f"{split}.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
+        print(f"  {split:12s}: {len(records)}")
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--jsonl',      default='data/cath/chain_set.jsonl')
-    parser.add_argument('--pdb_dir',    default='data/cath/pdb_files')
-    parser.add_argument('--tsv',        default='data/cath/3di_raw.tsv')
-    parser.add_argument('--out_jsonl',  default='data/cath/chain_set_3di.jsonl')
-    parser.add_argument('--max_length', type=int, default=500)
-    args = parser.parse_args()
-
-    entries = jsonl_to_pdbs(args.jsonl, args.pdb_dir, args.max_length)
-    run_foldseek(args.pdb_dir, args.tsv)
-    mapping = parse_tsv(args.tsv)
-    matched = merge(entries, mapping)
-    write_jsonl(matched, args.out_jsonl)
-    print("Done.")
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--data_dir",     default="data/cath2")
+    p.add_argument("--out_dir",      default="data/tokenized")
+    p.add_argument("--foldseek_bin", default="foldseek")
+    p.add_argument("--min_len",      type=int, default=30)
+    p.add_argument("--threads",      type=int, default=4)
+    main(p.parse_args())

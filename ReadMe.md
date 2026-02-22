@@ -11,28 +11,24 @@ python reproduce_cath.py (optional)
 # 3
 JSON to PDB to 3di tokens
 
-python jsonl_to_3di.py --jsonl data/cath/chain_set.jsonl --pdb_dir   data/cath/pdb_files --tsv data/cath/3di_raw.tsv --out_jsonl data/cath/chain_set_3di.jsonl
+python jsonl_to_3di.py --data_dir data/cath --out_dir data/tokenized
 
 # 4
 inference before lora
 
-python inference_3di.py --split Truncated --max_samples 10 \
-    --output_file results_3di_zeroshot.json
-
-python inference_3di.py --split Truncated --max_samples 10 --few_shot_k 3 \
-    --output_file results_3di_3shot.json
+python inference_3di.py --checkpoint results/llm_3di --test_file data/tokenized/test.jsonl
+python inference_3di.py --zero_shot --test_file data/tokenized/test.jsonl
 
 # 5
 lora training
-python lora_3di.py --split Truncated --max_samples 500 --num_epochs 3 --output_dir lora_3di
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 accelerate launch --num_processes 6     filteredfinetuning.py     --data_dir data/tokenized     --out_dir results/llm_3di_fixed     --max_length 1024     --batch_size 2     --grad_accum 8     --epochs 10     --lr 1e-4     --lora_r 32
 
 # 6
 inference after lora
 
-python inference_3di.py --split Truncated --max_samples 10\
-    --lora_adapter lora_3di \
-    --output_file results_3di_lora.json
-
+python inference_3di.py \
+    --checkpoint results/llm_3di results/llm_3di \
+    --test_file data/tokenized/test.jsonl
 
 
 
